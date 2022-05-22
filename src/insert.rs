@@ -19,6 +19,7 @@ const MIN_CHUNK_SIZE: usize = BUFFER_SIZE - 1024;
 #[must_use]
 pub struct Insert<T> {
     buffer: BytesMut,
+    chunk_count: usize,
     sender: Option<body::Sender>,
     handle: JoinHandle<Result<()>>,
     _marker: PhantomData<fn() -> T>, // TODO: test contravariance.
@@ -68,6 +69,7 @@ impl<T> Insert<T> {
 
         Ok(Insert {
             buffer: BytesMut::with_capacity(BUFFER_SIZE),
+            chunk_count: 0,
             sender: Some(sender),
             handle,
             _marker: PhantomData,
@@ -102,7 +104,17 @@ impl<T> Insert<T> {
             // Hyper uses non-trivial and inefficient (see benches) schema of buffering chunks.
             // It's difficult to determine when allocations occur.
             // So, instead we control it manually here and rely on the system allocator.
-            let chunk = mem::replace(&mut self.buffer, BytesMut::with_capacity(BUFFER_SIZE));
+            let mut chunk = mem::replace(&mut self.buffer, BytesMut::with_capacity(BUFFER_SIZE));
+
+            // Temporary workarround for https://github.com/ClickHouse/ClickHouse/issues/37420.
+            if self.chunk_count == 0 && chunk.starts_with(&[0xef, 0xbb, 0xbf]) {
+                let mut new_chunk = BytesMut::with_capacity(self.buffer.len() + 3);
+                new_chunk.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+                new_chunk.extend_from_slice(&chunk);
+                chunk = new_chunk;
+            }
+
+            self.chunk_count += 1;
 
             if let Some(sender) = &mut self.sender {
                 if sender.send_data(chunk.freeze()).await.is_err() {
